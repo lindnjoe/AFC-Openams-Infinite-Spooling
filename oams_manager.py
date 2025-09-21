@@ -43,11 +43,15 @@ class FPSLoadState:
 class OAMSRunoutMonitor:
     """
     Monitors filament runout for a specific FPS and handles automatic reload.
-    
+
     State Management:
     - Tracks runout detection and follower coasting
     - Manages automatic spool switching within filament groups
     - Coordinates with OAMS hardware for filament loading
+    - Triggers reload once the remaining filament in the tube reaches the
+      configured safety margin, independent of the total PTFE length. Each FPS
+      can optionally override the safety margin so coasting distance can be
+      tuned per extruder lane.
     """
     
     def __init__(self, 
@@ -69,8 +73,13 @@ class OAMSRunoutMonitor:
         self.state = OAMSRunoutState.STOPPED
         self.runout_position: Optional[float] = None
         self.bldc_clear_position: Optional[float] = None
+        self.runout_after_position: Optional[float] = None
         
         # Configuration
+        # Reload is triggered as soon as the follower has <= this much filament
+        # left in the tube after the BLDC clear phase, regardless of the OAMS
+        # unit's total PTFE length. This ensures AMS2-style lanes swap as soon
+        # as the configured safety margin is reached.
         self.reload_before_toolhead_distance = reload_before_toolhead_distance
         self.reload_callback = reload_callback
         
@@ -107,12 +116,33 @@ class OAMSRunoutMonitor:
                     logging.info("OAMS: Pause complete, coasting the follower.")
                     self.oams[fps_state.current_oams].set_oams_follower(0, 1)
                     self.bldc_clear_position = fps.extruder.last_position
+                    self.runout_after_position = 0.0
                     self.state = OAMSRunoutState.COASTING
-                    
+
             elif self.state == OAMSRunoutState.COASTING:
-                traveled_distance_after_bldc_clear = fps.extruder.last_position - self.bldc_clear_position
-                if traveled_distance_after_bldc_clear + self.reload_before_toolhead_distance > self.oams[fps_state.current_oams].filament_path_length / FILAMENT_PATH_LENGTH_FACTOR:
-                    logging.info("OAMS: Loading next spool in the filament group.")
+                traveled_distance_after_bldc_clear = max(
+                    fps.extruder.last_position - self.bldc_clear_position, 0.0
+                )
+                self.runout_after_position = traveled_distance_after_bldc_clear
+                path_length = getattr(
+                    self.oams[fps_state.current_oams], "filament_path_length", 0.0
+                )
+                effective_path_length = (
+                    path_length / FILAMENT_PATH_LENGTH_FACTOR if path_length else 0.0
+                )
+                consumed_with_margin = (
+                    self.runout_after_position
+                    + PAUSE_DISTANCE
+                    + self.reload_before_toolhead_distance
+                )
+
+                if consumed_with_margin >= effective_path_length:
+                    logging.info(
+                        "OAMS: Loading next spool (%.2f mm consumed + margin %.2f mm >= effective path %.2f mm).",
+                        self.runout_after_position + PAUSE_DISTANCE,
+                        self.reload_before_toolhead_distance,
+                        effective_path_length,
+                    )
                     self.state = OAMSRunoutState.RELOADING
                     self.reload_callback()
             else:
@@ -274,10 +304,17 @@ class OAMSManager:
         self.ready: bool = False  # System initialization complete
 
         # Configuration parameters
-        self.reload_before_toolhead_distance: float = config.getfloat("reload_before_toolhead_distance", 0.0)
+        self.reload_before_toolhead_distance: float = config.getfloat(
+            "reload_before_toolhead_distance",
+            0.0,
+        )
 
         # Cached mappings
         self.group_to_fps: Dict[str, str] = {}
+        self._canonical_lane_by_group: Dict[str, str] = {}
+        self._canonical_group_by_lane: Dict[str, str] = {}
+        self._lane_unit_map: Dict[str, str] = {}
+        self._lane_by_location: Dict[Tuple[str, int], str] = {}
 
         
         # Initialize hardware collections
@@ -508,6 +545,117 @@ class OAMSManager:
             self._rebuild_group_fps_index()
         return self.group_to_fps.get(group_name)
 
+    def _normalize_group_name(self, group: Optional[str]) -> Optional[str]:
+        """Return a trimmed filament group name or None if invalid."""
+        if not group or not isinstance(group, str):
+            return None
+        group = group.strip()
+        if not group:
+            return None
+        if " " in group:
+            group = group.split()[-1]
+        return group
+
+    def _rebuild_lane_location_index(self) -> None:
+        """Map each (OAMS name, bay index) tuple to its canonical AFC lane."""
+        mapping: Dict[Tuple[str, int], str] = {}
+        for group_name, lane_name in self._canonical_lane_by_group.items():
+            group = self.filament_groups.get(group_name)
+            if not group:
+                continue
+            for oam, bay_index in group.bays:
+                mapping[(oam.name, bay_index)] = lane_name
+        self._lane_by_location = mapping
+
+    def _ensure_afc_lane_cache(self, afc) -> None:
+        """Capture the canonical AFC lane mapping when AFC is available."""
+        lanes = getattr(afc, "lanes", {})
+        updated = False
+        for lane_name, lane in lanes.items():
+            canonical_group = self._normalize_group_name(getattr(lane, "_map", None))
+            if canonical_group is None:
+                canonical_group = self._normalize_group_name(getattr(lane, "map", None))
+            if canonical_group:
+                if lane_name not in self._canonical_group_by_lane:
+                    self._canonical_group_by_lane[lane_name] = canonical_group
+                    updated = True
+                if canonical_group not in self._canonical_lane_by_group:
+                    self._canonical_lane_by_group[canonical_group] = lane_name
+                    updated = True
+            unit_name = getattr(lane, "unit", None)
+            if unit_name and lane_name not in self._lane_unit_map:
+                self._lane_unit_map[lane_name] = unit_name
+        if updated:
+            self._rebuild_lane_location_index()
+
+    def _resolve_lane_for_state(
+        self,
+        fps_state: 'FPSState',
+        group_name: Optional[str],
+        afc,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Determine the canonical AFC lane and group for the provided FPS state."""
+
+        normalized_group = self._normalize_group_name(group_name)
+        lane_name: Optional[str] = None
+
+        # Prefer the physical OAMS location currently tracked by the FPS state.
+        if fps_state.current_oams and fps_state.current_spool_idx is not None:
+            lane_name = self._lane_by_location.get(
+                (fps_state.current_oams, fps_state.current_spool_idx)
+            )
+            if lane_name:
+                lane_group = self._canonical_group_by_lane.get(lane_name)
+                if lane_group:
+                    normalized_group = lane_group
+
+        # Fall back to the canonical mapping captured from AFC at startup.
+        if lane_name is None and normalized_group:
+            lane_name = self._canonical_lane_by_group.get(normalized_group)
+
+        lanes = getattr(afc, "lanes", {})
+
+        # As a last resort, inspect the lanes directly using their original map assignments.
+        if lane_name is None and normalized_group:
+            lane_name = next(
+                (
+                    name
+                    for name, lane in lanes.items()
+                    if self._normalize_group_name(getattr(lane, "_map", None))
+                    == normalized_group
+                ),
+                None,
+            )
+
+        canonical_group = normalized_group
+        if lane_name:
+            lane = lanes.get(lane_name)
+            if lane is not None:
+                canonical_candidate = self._normalize_group_name(
+                    getattr(lane, "_map", None)
+                )
+                if canonical_candidate is None:
+                    canonical_candidate = self._normalize_group_name(
+                        getattr(lane, "map", None)
+                    )
+
+                updated = False
+                if canonical_candidate:
+                    canonical_group = canonical_candidate
+                    if lane_name not in self._canonical_group_by_lane:
+                        self._canonical_group_by_lane[lane_name] = canonical_candidate
+                        updated = True
+                    if canonical_candidate not in self._canonical_lane_by_group:
+                        self._canonical_lane_by_group[canonical_candidate] = lane_name
+                        updated = True
+                unit_name = getattr(lane, "unit", None)
+                if unit_name and lane_name not in self._lane_unit_map:
+                    self._lane_unit_map[lane_name] = unit_name
+                if updated:
+                    self._rebuild_lane_location_index()
+
+        return lane_name, canonical_group
+
     def _get_afc(self):
         """Lazily retrieve the AFC object if it is available."""
         if self.afc is not None:
@@ -518,6 +666,7 @@ class OAMSManager:
             self.afc = None
             return None
         self.afc = afc
+        self._ensure_afc_lane_cache(afc)
         if not self._afc_logged:
             logging.info("OAMS: AFC integration detected; enabling same-FPS infinite runout support.")
             self._afc_logged = True
@@ -526,7 +675,7 @@ class OAMSManager:
     def _get_infinite_runout_target_group(
         self,
         fps_name: str,
-        current_group: Optional[str],
+        fps_state: 'FPSState',
     ) -> Tuple[Optional[str], Optional[str], bool, Optional[str]]:
         """
         Return the target filament group and lane for infinite runout, if configured.
@@ -535,31 +684,34 @@ class OAMSManager:
         delegated back to AFC (for example when the configured runout lane is not on
         the same FPS and therefore cannot be handled by OAMS directly).
         """
-        if current_group is None:
+        current_group = fps_state.current_group
+        normalized_group = self._normalize_group_name(current_group)
+        if normalized_group is None:
             return None, None, False, None
 
         afc = self._get_afc()
         if afc is None:
             return None, None, False, None
 
-        try:
-            lane_name = afc.tool_cmds.get(current_group)
-        except AttributeError:
-            lane_name = None
+        lane_name, resolved_group = self._resolve_lane_for_state(
+            fps_state,
+            normalized_group,
+            afc,
+        )
+
+        if resolved_group and resolved_group != normalized_group:
+            normalized_group = resolved_group
+            fps_state.current_group = resolved_group
 
         if not lane_name:
-            lane_name = next(
-                (
-                    name
-                    for name, lane in getattr(afc, "lanes", {}).items()
-                    if getattr(lane, "map", None) == current_group
-                ),
-                None,
+            logging.debug(
+                "OAMS: Unable to resolve AFC lane for group %s on %s",
+                normalized_group,
+                fps_name,
             )
-
-        if not lane_name:
             return None, None, False, None
 
+        lanes = getattr(afc, "lanes", {})
         lane = afc.lanes.get(lane_name)
         if lane is None:
             return None, None, False, lane_name
@@ -573,8 +725,21 @@ class OAMSManager:
             logging.warning(
                 "OAMS: Runout lane %s for %s on %s is not available; deferring to AFC",
                 runout_lane_name,
-                current_group,
+                normalized_group,
                 fps_name,
+            )
+            return None, runout_lane_name, True, lane_name
+
+        source_unit = self._lane_unit_map.get(lane_name)
+        target_unit = self._lane_unit_map.get(runout_lane_name)
+        if source_unit and target_unit and source_unit != target_unit:
+            logging.debug(
+                "OAMS: Runout lane %s (%s) for %s on %s belongs to different unit %s; deferring to AFC",
+                runout_lane_name,
+                target_unit,
+                normalized_group,
+                fps_name,
+                source_unit,
             )
             return None, runout_lane_name, True, lane_name
 
@@ -587,7 +752,7 @@ class OAMSManager:
         ):
             logging.debug(
                 "OAMS: Deferring infinite runout for %s on %s because lane %s (%s) spools to %s (%s)",
-                current_group,
+                normalized_group,
                 fps_name,
                 lane_name,
                 getattr(source_extruder, "name", "unknown"),
@@ -596,42 +761,61 @@ class OAMSManager:
             )
             return None, runout_lane_name, True, lane_name
 
-        target_group = next(
-            (group for group, mapped_lane in getattr(afc, "tool_cmds", {}).items()
-             if mapped_lane == runout_lane_name),
-            None,
-        )
-        if target_group is None:
-            target_group = getattr(target_lane, "map", None)
+        target_group = self._canonical_group_by_lane.get(runout_lane_name)
+        if not target_group:
+            target_group = self._normalize_group_name(getattr(target_lane, "_map", None))
+        if not target_group:
+            target_group = self._normalize_group_name(getattr(target_lane, "map", None))
 
-        if isinstance(target_group, str):
-            target_group = target_group.strip()
-            if " " in target_group:
-                target_group = target_group.split()[-1]
-
-        if not target_group or target_group == current_group:
+        if not target_group:
             logging.debug(
-                "OAMS: Runout lane %s for %s on %s does not map to a different filament group; deferring to AFC",
+                "OAMS: Runout lane %s for %s on %s has no canonical group; deferring to AFC",
                 runout_lane_name,
-                current_group,
+                normalized_group,
                 fps_name,
             )
             return None, runout_lane_name, True, lane_name
 
-        if target_group not in self.filament_groups or current_group not in self.filament_groups:
+        updated = False
+        if runout_lane_name not in self._canonical_group_by_lane:
+            self._canonical_group_by_lane[runout_lane_name] = target_group
+            updated = True
+        if target_group not in self._canonical_lane_by_group:
+            self._canonical_lane_by_group[target_group] = runout_lane_name
+            updated = True
+        if updated:
+            self._rebuild_lane_location_index()
+
+        if target_group == normalized_group:
+            logging.debug(
+                "OAMS: Runout lane %s for %s on %s does not map to a different filament group; deferring to AFC",
+                runout_lane_name,
+                normalized_group,
+                fps_name,
+            )
+            return None, runout_lane_name, True, lane_name
+
+        if normalized_group not in self.filament_groups:
+            logging.debug(
+                "OAMS: Source group %s is not managed by OAMS; deferring to AFC",
+                normalized_group,
+            )
+            return None, runout_lane_name, True, lane_name
+
+        if target_group not in self.filament_groups:
             logging.debug(
                 "OAMS: Runout mapping %s -> %s is not managed by OAMS; deferring to AFC",
-                current_group,
+                normalized_group,
                 target_group,
             )
             return None, runout_lane_name, True, lane_name
 
-        source_fps = self.group_fps_name(current_group)
+        source_fps = self.group_fps_name(normalized_group)
         target_fps = self.group_fps_name(target_group)
         if source_fps != fps_name or target_fps != fps_name:
             logging.info(
                 "OAMS: Deferring infinite runout for %s on %s to AFC lane %s because target group %s loads via %s",
-                current_group,
+                normalized_group,
                 fps_name,
                 runout_lane_name,
                 target_group,
@@ -641,7 +825,7 @@ class OAMSManager:
 
         logging.info(
             "OAMS: Infinite runout configured for %s on %s -> %s (lanes %s -> %s)",
-            current_group,
+            normalized_group,
             fps_name,
             target_group,
             lane_name,
@@ -935,8 +1119,9 @@ class OAMSManager:
                 source_group = fps_state.current_group
                 target_group, target_lane, delegate_to_afc, source_lane = self._get_infinite_runout_target_group(
                     fps_name,
-                    source_group,
+                    fps_state,
                 )
+                source_group = fps_state.current_group
 
                 if delegate_to_afc:
                     delegated = self._delegate_runout_to_afc(
@@ -1042,7 +1227,29 @@ class OAMSManager:
                     monitor.paused()
                 return
 
-            monitor = OAMSRunoutMonitor(self.printer, fps_name, self.fpss[fps_name], fps_state, self.oams, _reload_callback, reload_before_toolhead_distance=self.reload_before_toolhead_distance)
+            fps_reload_margin = getattr(
+                self.fpss[fps_name],
+                "reload_before_toolhead_distance",
+                None,
+            )
+            if fps_reload_margin is None:
+                fps_reload_margin = self.reload_before_toolhead_distance
+            else:
+                logging.debug(
+                    "OAMS: Using FPS-specific reload margin %.2f mm for %s",
+                    fps_reload_margin,
+                    fps_name,
+                )
+
+            monitor = OAMSRunoutMonitor(
+                self.printer,
+                fps_name,
+                self.fpss[fps_name],
+                fps_state,
+                self.oams,
+                _reload_callback,
+                reload_before_toolhead_distance=fps_reload_margin,
+            )
             self.runout_monitors[fps_name] = monitor
             monitor.start()
 
